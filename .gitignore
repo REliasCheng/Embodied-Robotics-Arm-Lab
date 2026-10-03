@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Build and packaging
+build/
+dist/
+*.egg-info/
+
+# Local runtime data
+.cache/
+data/
+outputs/
+wandb/
+camera_id_images/
+
+# Models and generated binaries
+*.pt
+*.pth
+*.safetensors
+*.onnx
+*.engine
+*.bin
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example

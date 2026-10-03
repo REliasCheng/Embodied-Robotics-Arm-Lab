@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="620" viewBox="0 0 1200 620" role="img" aria-labelledby="title desc">
+  <title id="title">Robotic arm leader-follower system overview</title>
+  <desc id="desc">Leader joint state and optional camera frames flow through a LeRobot control workflow and hardware abstraction to serial motor buses, follower motion, and optional local episode data.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10Z" fill="#8b949e"/></marker>
+    <style>
+      .bg{fill:#0d1117}.grid{stroke:#30363d;opacity:.28}.box{stroke-width:2}.input{fill:#21262d;stroke:#8b949e}.core{fill:#0d419d;stroke:#58a6ff}.middleware{fill:#163a5f;stroke:#79c0ff}.hardware{fill:#1f6f3d;stroke:#3fb950}.output{fill:#f0f6fc;stroke:#c9d1d9}.title{font:700 28px system-ui,sans-serif;fill:#f0f6fc}.sub{font:16px system-ui,sans-serif;fill:#8b949e}.label{font:700 17px system-ui,sans-serif;fill:#f0f6fc;text-anchor:middle}.detail{font:13px system-ui,sans-serif;fill:#c9d1d9;text-anchor:middle}.dark{fill:#0d1117}.arrow{fill:none;stroke:#8b949e;stroke-width:3;marker-end:url(#arrow)}
+    </style>
+  </defs>
+  <rect class="bg" width="1200" height="620" rx="22"/><path class="grid" d="M0 110H1200M0 510H1200M300 0V620M600 0V620M900 0V620"/>
+  <text class="title" x="50" y="54">Leader–Follower Robotic Arm Integration</text><text class="sub" x="50" y="84">Source-backed host control path with hardware and evidence boundaries kept explicit</text>
+  <rect class="box input" x="105" y="130" width="440" height="72" rx="12"/><text class="label" x="325" y="160">Leader Joint State</text><text class="detail" x="325" y="184">five motion joints + gripper</text>
+  <rect class="box input" x="655" y="130" width="440" height="72" rx="12"/><text class="label" x="875" y="160">Optional Camera Frames</text><text class="detail" x="875" y="184">OpenCV configuration entries</text>
+  <rect class="box core" x="300" y="245" width="600" height="76" rx="12"/><text class="label" x="600" y="276">LeRobot Control Workflow</text><text class="detail" x="600" y="302">Teleoperate · Record · Replay</text>
+  <rect class="box middleware" x="300" y="360" width="600" height="76" rx="12"/><text class="label" x="600" y="391">Configuration / Robot Abstraction</text><text class="detail" x="600" y="417">Hydra YAML · ManipulatorRobot · Motor bus interfaces</text>
+  <rect class="box hardware" x="105" y="475" width="440" height="72" rx="12"/><text class="label" x="325" y="505">GBot / Feetech Serial Buses</text><text class="detail" x="325" y="529">device-specific ports and calibration</text>
+  <rect class="box output" x="655" y="475" width="440" height="72" rx="12"/><text class="label dark" x="875" y="505">Follower Motion / Episode Data</text><text class="detail dark" x="875" y="529">runtime evidence not provided</text>
+  <path class="arrow" d="M325 202V225H515V245M875 202V225H685V245M600 321V360M520 436V455H325V475M680 436V455H875V475"/>
+</svg>
