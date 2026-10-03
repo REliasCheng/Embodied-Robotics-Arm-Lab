@@ -16,9 +16,9 @@
 | Control | LeRobot teleoperate、record 与 replay workflows |
 | Communication | USB serial motor buses；GBot leader 与 Feetech follower backends |
 | Camera Interface | Optional OpenCV camera entries defined in configuration |
-| Evidence | Source/configuration review 与 Python syntax check；package build、hardware/runtime evidence not provided |
+| Evidence | Source/configuration review and Python AST syntax validation completed；host functional tests、package build、hardware validation and runtime evidence not provided |
 
-> 🧪 **Evidence:** 公开源码与配置入口可定位，Python syntax check 已通过；package build、机械臂连接、运动和相机运行证据未提供。
+> 🧪 **Evidence:** 公开源码与配置入口可定位，Python AST syntax validation 已通过；host functional test、package build、机械臂硬件与 runtime evidence 尚未提供。
 
 ## 📌 Overview
 
@@ -103,7 +103,9 @@ Embodied-Robotics-Arm-Lab/
 
 ### 💻 Host Test
 
-**Status:** Passed. 公开 Python 文件已完成 AST syntax check，未发现语法错误。
+**Status:** Not Provided. 当前公开仓库未提供独立的 host-side functional test 或 integration test。
+
+**Syntax Validation:** Passed. Published Python source files completed AST syntax validation without syntax errors.
 
 ### 🔨 Build Verification
 

@@ -5,14 +5,15 @@
 | Level | Status | Evidence |
 | --- | --- | --- |
 | Source Review | Passed | Public paths、configuration links 与 third-party boundary reviewed |
-| Host Test | Passed | All public Python files parsed with Python AST |
+| Syntax Validation | Passed | All published Python source files parsed with Python AST without syntax errors |
+| Host Test | Not Provided | No independent host-side functional test or integration test is provided |
 | Build Verification | Not Performed | Local environment does not provide `build` or `poetry-core` |
 | Hardware Validation | Not Provided | No reproducible arm、motor bus or camera test record is public |
 | Runtime Evidence | Not Provided | No teleoperation、record、replay or policy execution log is public |
 
 ## Interpretation
 
-Python syntax check 只证明源码可以被 parser 读取。本轮未执行 package build，也没有安装额外构建依赖。语法检查不证明依赖安装成功、serial communication 成功、camera capture 成功或机械臂运动成功。
+Python AST syntax validation 只证明源码可以被 parser 读取，不属于 functional test、runtime test 或 integration test。本轮未提供独立的 host-side functional test，未执行 package build，也没有安装额外构建依赖。语法检查不证明依赖安装成功、serial communication 成功、camera capture 成功或机械臂运动成功。
 
 ## Reproducible Checks
 
