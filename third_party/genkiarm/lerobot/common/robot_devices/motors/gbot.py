@@ -62,6 +62,35 @@ class JointOutOfRangeError(Exception):
         self.message = message
         super().__init__(self.message)
 
+
+class GBotCommunicationError(RuntimeError):
+    """A bus operation failed; completed_motor_ids may already have acted."""
+
+    def __init__(self, operation, register, motor_id, error_code=None, completed_motor_ids=(), detail=None):
+        self.operation = operation
+        self.register = register
+        self.motor_id = motor_id
+        self.error_code = error_code
+        self.completed_motor_ids = tuple(completed_motor_ids)
+        self.partial_execution = bool(self.completed_motor_ids) and operation == "write"
+        # Even a failed acknowledgement cannot prove that the motor did not act.
+        self.state_uncertain = operation == "write"
+        super().__init__(
+            f"GBot {operation} failed for motor {motor_id}, register {register}; "
+            f"error_code={error_code!r}; completed_motor_ids={self.completed_motor_ids}; "
+            f"partial_execution={self.partial_execution}; state_uncertain={self.state_uncertain}"
+            + (f"; {detail}" if detail else "")
+        )
+
+class GBotConnectionError(RuntimeError):
+    """A port lifecycle operation failed; the physical port state is uncertain."""
+
+    def __init__(self, operation, port, detail):
+        self.operation = operation
+        self.port = port
+        self.state_uncertain = True
+        super().__init__(f"GBot {operation} failed for port {port!r}; state uncertain: {detail}")
+
 class GBotMotorsBus:
     def __init__(
         self,
@@ -92,6 +121,7 @@ class GBotMotorsBus:
         self.__sync_connector: SyncConnector = SyncConnector(self.__port_handler)
         
         self.is_connected = False
+        self._cleanup_required = False
         
     def connect(self):
         """连接到电机总线"""
@@ -99,28 +129,38 @@ class GBotMotorsBus:
             raise RobotDeviceAlreadyConnectedError(
                 f"GBotMotorsBus is already connected to port {self.port}."
             )
+        if self._cleanup_required:
+            raise GBotConnectionError("connect", self.port, "previous port state needs confirmed cleanup")
         
+        self._cleanup_required = True
         try:
             if not self.__port_handler.open(self.port):
                 raise OSError(f"Failed to open port '{self.port}'.")
+            if not self.__port_handler.is_open():
+                raise OSError(f"Port '{self.port}' did not report an open state.")
         except Exception as e:
             raise RobotDeviceNotConnectedError(
                 f"Failed to connect to port {self.port}. Error: {e}"
-            )
+            ) from e
         self.is_connected = True
         
     def disconnect(self):
         """断开与电机总线的连接"""
-        if not self.is_connected:
+        if not self.is_connected and not self._cleanup_required:
             raise RobotDeviceNotConnectedError(
                 f"GBotMotorsBus is not connected to port {self.port}."
             )
-        # 实现断开逻辑
         try:
             self.__port_handler.close()
+            if self.__port_handler.is_open():
+                raise OSError(f"Port {self.port!r} remains open after close()")
         except Exception as e:
-            print(f"Failed to disconnect from port {self.port}. Error: {e}")
+            # A close exception can occur after the transport acted. Until a
+            # later observation confirms closure, keep the bus unavailable for
+            # acknowledgement and reconnection.
+            raise GBotConnectionError("disconnect", self.port, e) from e
         self.is_connected = False
+        self._cleanup_required = False
         
     def reconnect(self):
         """重新连接电机总线"""
@@ -163,6 +203,66 @@ class GBotMotorsBus:
     def set_calibration(self, calibration: dict[str, list]):
         """设置校准参数"""
         self.calibration = calibration
+
+    def _calibration_input(
+        self, values: np.ndarray | list | int | float, motor_names: list[str] | str | None
+    ) -> tuple[np.ndarray, list[str]]:
+        names = self.motor_names if motor_names is None else motor_names
+        if isinstance(names, str):
+            names = [names]
+        if len(names) != len(set(names)) or any(name not in self.motors for name in names):
+            raise ValueError(f"Invalid motor_names for calibration: {names}")
+        array = np.asarray(values, dtype=np.float32)
+        if array.ndim == 0 and len(names) == 1:
+            array = array.reshape(1)
+        if array.ndim != 1 or len(array) != len(names):
+            raise ValueError(f"Calibration expects one-dimensional values for {len(names)} motors; got shape {array.shape}")
+        calibrated_names = self.calibration["motor_names"]
+        missing = [name for name in names if name not in calibrated_names]
+        if missing:
+            raise ValueError(f"Missing calibration for motor_names: {missing}")
+        modes = self.calibration.get("calib_mode", [])
+        for name in names:
+            index = calibrated_names.index(name)
+            if index >= len(modes) or modes[index] not in CalibrationMode.__members__:
+                raise ValueError(f"Invalid calibration mode for motor {name}")
+        return array.copy(), names
+
+    def _address(self, model, data_name, motor_id, operation, completed=()):
+        address = self.model_ctrl_table.get(model, {}).get(data_name)
+        if address is None:
+            raise GBotCommunicationError(operation, data_name, motor_id, completed_motor_ids=completed,
+                                         detail=f"No register address for model {model}")
+        return address
+
+    def _read_one(self, motor_id, model, data_name):
+        address = self._address(model, data_name, motor_id, "read")
+        try:
+            result = self.__sync_connector.read(motor_id, address)
+            if not result.is_success():
+                raise GBotCommunicationError("read", data_name, motor_id, result.get_error_code())
+            value = result.get_data(address)
+            if value is None:
+                raise GBotCommunicationError("read", data_name, motor_id, detail="Successful response has no register data")
+            return value
+        except GBotCommunicationError:
+            raise
+        except Exception as exc:
+            code = getattr(exc, "error_code", getattr(exc, "errno", None))
+            raise GBotCommunicationError("read", data_name, motor_id, code, detail=str(exc)) from exc
+
+    def _write_one(self, motor_id, model, data_name, value, completed):
+        address = self._address(model, data_name, motor_id, "write", completed)
+        try:
+            result = self.__sync_connector.write(motor_id, address, value)
+            if not result.is_success():
+                raise GBotCommunicationError("write", data_name, motor_id, result.get_error_code(), completed)
+        except GBotCommunicationError:
+            raise
+        except Exception as exc:
+            code = getattr(exc, "error_code", getattr(exc, "errno", None))
+            raise GBotCommunicationError("write", data_name, motor_id, code, completed_motor_ids=completed,
+                                         detail=str(exc)) from exc
         
     def apply_calibration_autocorrect(self, values: np.ndarray | list, motor_names: list[str] | None):
         """This function apply the calibration, automatically detects out of range errors for motors values and attempt to correct.
@@ -191,11 +291,7 @@ class GBotMotorsBus:
         To harmonize between motors of the same model, different robots, or even models of different brands, we propose to work
         in the centered nominal degree range ]-180, 180[.
         """
-        if motor_names is None:
-            motor_names = self.motor_names
-
-        # Convert from unsigned int32 original range [0, 2**32] to signed float32 range
-        values = values.astype(np.float32)
+        values, motor_names = self._calibration_input(values, motor_names)
 
         for i, name in enumerate(motor_names):
             calib_idx = self.calibration["motor_names"].index(name)
@@ -270,11 +366,7 @@ class GBotMotorsBus:
 
         Note: A full turn corresponds to 360 degrees but also to 4096 steps for a motor resolution of 4096.
         """
-        if motor_names is None:
-            motor_names = self.motor_names
-
-        # Convert from unsigned int32 original range [0, 2**32] to signed float32 range
-        values = values.astype(np.float32)
+        values, motor_names = self._calibration_input(values, motor_names)
 
         for i, name in enumerate(motor_names):
             calib_idx = self.calibration["motor_names"].index(name)
@@ -306,16 +398,14 @@ class GBotMotorsBus:
                     else:
                         self.calibration["homing_offset"][calib_idx] += resolution
         
-    def revert_calibration(self, values: np.ndarray | list, motor_names: list[str] | None):
+    def revert_calibration(
+        self, values: np.ndarray | list | int | float, motor_names: list[str] | None
+    ):
         """Convert back from the universal float32 nominal degree range ]-180.0, 180.0[ to the unsigned int32 joint position range [0, 2**32[.
 
         For more info, see docstring of `apply_calibration`.
         """
-        if motor_names is None:
-            motor_names = self.motor_names
-
-        # Convert to float32 to avoid precision issues
-        values = values.astype(np.float32)
+        values, motor_names = self._calibration_input(values, motor_names)
 
         for i, name in enumerate(motor_names):
             calib_idx = self.calibration["motor_names"].index(name)
@@ -366,18 +456,7 @@ class GBotMotorsBus:
         values = []
         for index, motor_idx in enumerate(motor_ids):
             model = motor_models[index]
-            address = self.model_ctrl_table[model][data_name]
-            if address is None:
-                print(f"Invalid data_name '{data_name}' for model '{model}' on Motor '{motor_idx}'.")
-                continue
-            
-            result = self.__sync_connector.read(motor_idx, address)
-            if not result.is_success():
-                print(f"Failed to read data '{data_name}' for Motor '{motor_idx}'.")
-                value = 0
-            else:
-                value = result.get_data(address)
-            values.append(value)
+            values.append(self._read_one(motor_idx, model, data_name))
             
         if return_list:
             return values
@@ -397,25 +476,10 @@ class GBotMotorsBus:
         if isinstance(motor_names, str):
             motor_names = [motor_names]
         
-        motor_ids = []
-
         values = []
         for name in motor_names:
             motor_idx, model = self.motors[name]
-            motor_ids.append(motor_idx)
-
-            address = self.model_ctrl_table[model][data_name]
-            if address is None:
-                print(f"Invalid data_name '{data_name}' for model '{model}' on Motor '{motor_idx}'.")
-                continue
-            
-            result = self.__sync_connector.read(motor_idx, address)
-            if not result.is_success():
-                print(f"Failed to read data '{data_name}' for Motor '{motor_idx}'.")
-                value = 0
-            else:
-                value = result.get_data(address)
-            values.append(value)
+            values.append(self._read_one(motor_idx, model, data_name))
         
         values = np.array(values)
 
@@ -432,18 +496,11 @@ class GBotMotorsBus:
                 f"GBotMotorsBus is not connected to port {self.port}."
             )
         
+        completed: list[int] = []
         for index, motor_idx in enumerate(motor_ids):
             model = motor_models[index]
-            address = self.model_ctrl_table[model][data_name]
-            if address is None:
-                print(f"Invalid data_name '{data_name}' for model '{model}' on Motor '{motor_idx}'.")
-                continue
-
-            result = self.__sync_connector.write(motor_idx, address, values[index])
-            if result.is_success():
-                print(f"Data '{data_name}' written successfully to Motor '{motor_idx}'.")
-            else:
-                print(f"Failed to write data '{data_name}' to Motor '{motor_idx}'.")
+            self._write_one(motor_idx, model, data_name, values[index], completed)
+            completed.append(motor_idx)
                 
     def write(self, data_name, values: int | float | np.ndarray, motor_names: str | list[str] | None = None):
         """写入电机数据"""
@@ -461,24 +518,17 @@ class GBotMotorsBus:
         if data_name in CALIBRATION_REQUIRED:
             values = self.revert_calibration(values, motor_names)
 
+        completed: list[int] = []
         for index, name in enumerate(motor_names):
             motor_idx, model = self.motors[name]
-            address = self.model_ctrl_table[model][data_name]
-
-            if address is None:
-                print(f"Invalid data_name '{data_name}' for model '{model}' on Motor '{motor_idx}'.")
-                continue
-
-            if isinstance(values, (np.ndarray, list)):
-                result = self.__sync_connector.write(motor_idx, address, values[index])
-            else:
-                result = self.__sync_connector.write(motor_idx, address, values)
-            if result.is_success():
-                print(f"Data '{data_name}' written successfully to Motor '{motor_idx}'.")
-            else:
-                print(f"Failed to write data '{data_name}' to Motor '{motor_idx}'.")
+            value = values[index] if isinstance(values, (np.ndarray, list)) else values
+            self._write_one(motor_idx, model, data_name, value, completed)
+            completed.append(motor_idx)
         
     def __del__(self):
-        """析构函数"""
-        if getattr(self, "is_connected", False):
-            self.disconnect()
+        """Best-effort cleanup; explicit disconnect is required for confirmation."""
+        if getattr(self, "is_connected", False) or getattr(self, "_cleanup_required", False):
+            try:
+                self.disconnect()
+            except Exception:
+                logging.exception("GBot destructor could not confirm port closure")
