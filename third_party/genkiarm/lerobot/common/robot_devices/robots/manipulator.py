@@ -9,6 +9,7 @@ import logging
 import time
 import warnings
 from dataclasses import dataclass, field, replace
+from functools import wraps
 from pathlib import Path
 from typing import Sequence
 
@@ -21,14 +22,64 @@ from lerobot.common.robot_devices.robots.utils import get_arm_id
 from lerobot.common.robot_devices.utils import RobotDeviceAlreadyConnectedError, RobotDeviceNotConnectedError
 
 
+class RobotControlFaultError(RuntimeError):
+    """Control commands are blocked until a fault is acknowledged and reconnected."""
+
+
+class RobotDisconnectError(RuntimeError):
+    """One or more devices could not be confirmed disconnected."""
+
+    def __init__(self, failures: dict[str, Exception]):
+        self.failures = failures.copy()
+        super().__init__("Disconnect failed for: " +
+                         ", ".join(f"{name} ({error!r})" for name, error in self.failures.items()))
+
+
+def validate_control_positions(values: torch.Tensor, expected: int, label: str) -> torch.Tensor:
+    """Reject malformed or unsafe-to-convert positions before any command is sent."""
+    if not isinstance(values, torch.Tensor) or values.ndim != 1 or len(values) != expected:
+        raise ValueError(f"{label} must be a one-dimensional tensor with {expected} positions")
+    if values.device.type != "cpu" or values.requires_grad or values.dtype == torch.bool or values.is_complex():
+        raise ValueError(f"{label} must be a real CPU numeric tensor without gradients")
+    numeric = values.to(torch.float64)
+    if not torch.isfinite(numeric).all().item():
+        raise ValueError(f"{label} contains NaN or infinity")
+    bounds = np.iinfo(np.int32)
+    if ((numeric < bounds.min) | (numeric > bounds.max)).any().item():
+        raise ValueError(f"{label} cannot be safely converted to int32")
+    return values
+
+
+def checked_motor_read(raw: np.ndarray, expected: int, label: str) -> torch.Tensor:
+    if not isinstance(raw, np.ndarray):
+        raise ValueError(f"{label} must be a NumPy array")
+    return validate_control_positions(torch.from_numpy(raw), expected, label)
+
+
+def validate_gripper_target(value) -> int | float | np.integer | np.floating:
+    """Validate a scalar target before connecting or writing to any device."""
+    if isinstance(value, (bool, np.bool_)) or not isinstance(
+        value, (int, float, np.integer, np.floating)
+    ):
+        raise ValueError("gripper_open_degree must be a real numeric scalar")
+    try:
+        numeric = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError("gripper_open_degree cannot be represented as a finite target") from exc
+    bounds = np.iinfo(np.int32)
+    if not np.isfinite(numeric) or numeric < bounds.min or numeric > bounds.max:
+        raise ValueError("gripper_open_degree cannot be safely converted to int32")
+    return value
+
+
 def ensure_safe_goal_position(
     goal_pos: torch.Tensor, present_pos: torch.Tensor, max_relative_target: float | list[float]
 ):
     # Cap relative action target magnitude for safety.
     diff = goal_pos - present_pos
-    max_relative_target = torch.tensor(max_relative_target)
-    safe_diff = torch.minimum(diff, max_relative_target)
-    safe_diff = torch.maximum(safe_diff, -max_relative_target)
+    relative_limit = torch.tensor(max_relative_target)
+    safe_diff = torch.minimum(diff, relative_limit)
+    safe_diff = torch.maximum(safe_diff, -relative_limit)
     safe_goal_pos = present_pos + safe_diff
 
     if not torch.allclose(goal_pos, safe_goal_pos):
@@ -39,6 +90,25 @@ def ensure_safe_goal_position(
         )
 
     return safe_goal_pos
+
+
+def guarded_setup(operation):
+    """Apply the same fault gate to public setup methods and control methods."""
+    @wraps(operation)
+    def guarded(self, *args, **kwargs):
+        if not self._connection_setup_active:
+            self._check_control_fault()
+            if not self.is_connected:
+                raise RobotDeviceNotConnectedError(
+                    "ManipulatorRobot must be connected before changing calibration or presets."
+                )
+        try:
+            return operation(self, *args, **kwargs)
+        except Exception as exc:
+            if not self._connection_setup_active:
+                self._latch_control_fault(exc)
+            raise
+    return guarded
 
 
 @dataclass
@@ -210,7 +280,7 @@ class ManipulatorRobot:
     def __init__(
         self,
         config: ManipulatorRobotConfig | None = None,
-        calibration_dir: Path = ".cache/calibration/koch",
+        calibration_dir: Path | str = ".cache/calibration/koch",
         **kwargs,
     ):
         if config is None:
@@ -224,11 +294,63 @@ class ManipulatorRobot:
         self.follower_arms = self.config.follower_arms
         self.cameras = self.config.cameras
         self.is_connected = False
-        self.logs = {}
+        self.logs: dict[str, float] = {}
 
         # EMA filter for smoothing leader positions to reduce follower jitter
         self.smoothing_factor = 0.25  # Higher value = less smoothing, faster response
         self.smoothed_leader_pos: dict[str, torch.Tensor] = {}
+        self.control_fault: Exception | None = None
+        self.fault_acknowledged = False
+        self.completed_follower_arms: list[str] = []
+        self._resources_needing_disconnect: dict[str, object] = {}
+        self.disconnect_failures: dict[str, Exception] = {}
+        self.connection_cleanup_failures: dict[str, Exception] = {}
+        self.torque_state_uncertain = False
+        self.fault_history: list[Exception] = []
+        self._connection_setup_active = False
+
+    def _devices(self):
+        for role, devices in (("follower", self.follower_arms), ("leader", self.leader_arms),
+                              ("camera", self.cameras)):
+            for name, device in devices.items():
+                yield f"{role}:{name}", device
+
+    def _disconnect_pending_devices(self):
+        if self.is_connected and not self._resources_needing_disconnect:
+            self._resources_needing_disconnect = dict(self._devices())
+        failures = {}
+        for key, device in list(self._resources_needing_disconnect.items()):
+            try:
+                device.disconnect()
+            except Exception as exc:
+                failures[key] = exc
+            else:
+                del self._resources_needing_disconnect[key]
+        self.disconnect_failures = failures
+        self.is_connected = bool(self._resources_needing_disconnect)
+        return failures
+
+    def acknowledge_control_fault(self):
+        """Manual fault acknowledgement, only after disconnecting the robot."""
+        if self.is_connected or self._resources_needing_disconnect:
+            raise RobotControlFaultError("Disconnect before acknowledging the control fault.")
+        if self.control_fault is None:
+            raise RobotControlFaultError("There is no control fault to acknowledge.")
+        self.fault_acknowledged = True
+
+    def _check_control_fault(self):
+        if self.control_fault is not None:
+            raise RobotControlFaultError(
+                "Control fault is latched. Disconnect, acknowledge_control_fault(), then reconnect. "
+                f"Original error: {self.control_fault}"
+            ) from self.control_fault
+
+    def _latch_control_fault(self, error):
+        if self.control_fault is not None and self.control_fault is not error:
+            self.fault_history.append(self.control_fault)
+        self.control_fault = error
+        self.fault_acknowledged = False
+        self.smoothed_leader_pos.clear()
 
     @property
     def has_camera(self):
@@ -250,76 +372,114 @@ class ManipulatorRobot:
         return available_arms
 
     def connect(self):
+        if self.control_fault is not None and not self.fault_acknowledged:
+            self._check_control_fault()
         if self.is_connected:
             raise RobotDeviceAlreadyConnectedError(
                 "ManipulatorRobot is already connected. Do not run `robot.connect()` twice."
             )
-
+        if self._resources_needing_disconnect:
+            raise RobotControlFaultError("Unconfirmed connected devices remain; retry disconnect before reconnecting.")
         if not self.leader_arms and not self.follower_arms and not self.cameras:
             raise ValueError(
                 "ManipulatorRobot doesn't have any device to connect. See example of usage in docstring of the class."
             )
 
-        # Connect the arms
-        for name in self.follower_arms:
-            print(f"Connecting {name} follower arm.")
-            self.follower_arms[name].connect()
-        for name in self.leader_arms:
-            print(f"Connecting {name} leader arm.")
-            self.leader_arms[name].connect()
+        torque_enable_attempted = []
+        self._connection_setup_active = True
+        try:
+            gripper_target = None
+            if self.config.gripper_open_degree is not None:
+                if self.robot_type not in ["koch", "koch_bimanual"]:
+                    raise NotImplementedError(f"{self.robot_type} does not support gripper_open_degree")
+                gripper_target = validate_gripper_target(self.config.gripper_open_degree)
 
-        if self.robot_type in ["koch", "koch_bimanual", "aloha"]:
-            from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
-        elif self.robot_type in ["so100", "moss"]:
-            from lerobot.common.robot_devices.motors.feetech import TorqueMode
-        elif self.robot_type == "gbot":
-            from lerobot.common.robot_devices.motors.gbot import TorqueMode
+            for key, device in self._devices():
+                if key.startswith("camera:"):
+                    continue
+                # A failed connect() may leave a port open: track the attempt first.
+                self._resources_needing_disconnect[key] = device
+                device.connect()
 
-        # We assume that at connection time, arms are in a rest position, and torque can
-        # be safely disabled to run calibration and/or set robot preset configurations.
-        for name in self.follower_arms:
-            self.follower_arms[name].write("Torque_Enable", TorqueMode.DISABLED.value)
-        for name in self.leader_arms:
-            self.leader_arms[name].write("Torque_Enable", TorqueMode.DISABLED.value)
+            if self.robot_type in ["koch", "koch_bimanual", "aloha"]:
+                from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
+            elif self.robot_type in ["so100", "moss"]:
+                from lerobot.common.robot_devices.motors.feetech import TorqueMode
+            elif self.robot_type == "gbot":
+                from lerobot.common.robot_devices.motors.gbot import TorqueMode
 
-        self.activate_calibration()
+            # Preserve the torque-off calibration and preset sequence.
+            for arm in (*self.follower_arms.values(), *self.leader_arms.values()):
+                arm.write("Torque_Enable", TorqueMode.DISABLED.value)
+            self.activate_calibration()
+            if self.robot_type in ["koch", "koch_bimanual"]:
+                self.set_koch_robot_preset()
+            elif self.robot_type == "aloha":
+                self.set_aloha_robot_preset()
+            elif self.robot_type in ["so100", "moss"]:
+                self.set_so100_robot_preset()
 
-        # Set robot preset (e.g. torque in leader gripper for Koch v1.1)
-        if self.robot_type in ["koch", "koch_bimanual"]:
-            self.set_koch_robot_preset()
-        elif self.robot_type == "aloha":
-            self.set_aloha_robot_preset()
-        elif self.robot_type in ["so100", "moss"]:
-            self.set_so100_robot_preset()
+            # All required health checks precede the normal torque-enable stage.
+            for role, arms in (("follower", self.follower_arms), ("leader", self.leader_arms)):
+                for name, arm in arms.items():
+                    checked_motor_read(arm.read("Present_Position"), len(arm.motor_names),
+                                       f"connect {role} {name} position")
+            for name, camera in self.cameras.items():
+                self._resources_needing_disconnect[f"camera:{name}"] = camera
+                camera.connect()
 
-        # Enable torque on all motors of the follower arms
-        for name in self.follower_arms:
-            print(f"Activating torque on {name} follower arm.")
-            self.follower_arms[name].write("Torque_Enable", 1)
+            if gripper_target is not None:
+                for name, arm in self.leader_arms.items():
+                    torque_enable_attempted.append((f"leader:{name}", arm, "gripper"))
+                    arm.write("Torque_Enable", 1, "gripper")
+                    arm.write("Goal_Position", gripper_target, "gripper")
 
-        if self.config.gripper_open_degree is not None:
-            if self.robot_type not in ["koch", "koch_bimanual"]:
-                raise NotImplementedError(
-                    f"{self.robot_type} does not support position AND current control in the handle, which is require to set the gripper open."
-                )
-            # Set the leader arm in torque mode with the gripper motor set to an angle. This makes it possible
-            # to squeeze the gripper and have it spring back to an open position on its own.
-            for name in self.leader_arms:
-                self.leader_arms[name].write("Torque_Enable", 1, "gripper")
-                self.leader_arms[name].write("Goal_Position", self.config.gripper_open_degree, "gripper")
+            for name, arm in self.follower_arms.items():
+                torque_enable_attempted.append((f"follower:{name}", arm, None))
+                arm.write("Torque_Enable", 1)
 
-        # Check both arms can be read
-        for name in self.follower_arms:
-            self.follower_arms[name].read("Present_Position")
-        for name in self.leader_arms:
-            self.leader_arms[name].read("Present_Position")
-
-        # Connect the cameras
-        for name in self.cameras:
-            self.cameras[name].connect()
+            # A post-enable read may still fail; do not clear a fault until it passes.
+            for name, arm in self.follower_arms.items():
+                checked_motor_read(arm.read("Present_Position"), len(arm.motor_names),
+                                   f"post-enable follower {name} position")
+        except Exception as exc:
+            cleanup_errors = {}
+            if torque_enable_attempted:
+                self.torque_state_uncertain = True
+            for key, arm, motor_name in reversed(torque_enable_attempted):
+                try:
+                    if motor_name is None:
+                        arm.write("Torque_Enable", 0)
+                    else:
+                        arm.write("Torque_Enable", 0, motor_name)
+                except Exception as cleanup_exc:
+                    cleanup_errors[f"torque_disable:{key}"] = cleanup_exc
+            cleanup_errors.update(
+                {f"disconnect:{key}": failure
+                 for key, failure in self._disconnect_pending_devices().items()}
+            )
+            self.connection_cleanup_failures = cleanup_errors
+            for key, failure in cleanup_errors.items():
+                logging.error("Connection cleanup failed for %s: %r", key, failure)
+            try:
+                exc.cleanup_failures = cleanup_errors
+            except (AttributeError, TypeError):
+                # The same details remain available on the robot instance.
+                logging.error("Could not attach cleanup failures to the original exception")
+            self._latch_control_fault(exc)
+            raise
+        finally:
+            self._connection_setup_active = False
 
         self.is_connected = True
+        self.disconnect_failures = {}
+        if self.fault_acknowledged:
+            self.fault_history.append(self.control_fault)
+            self.control_fault = None
+            self.fault_acknowledged = False
+            self.smoothed_leader_pos.clear()
 
+    @guarded_setup
     def activate_calibration(self):
         """After calibration all motors function in human interpretable ranges.
         Rotations are expressed in degrees in nominal range of [-180, 180],
@@ -374,6 +534,7 @@ class ManipulatorRobot:
             calibration = load_or_run_calibration_(name, arm, "leader")
             arm.set_calibration(calibration)
 
+    @guarded_setup
     def set_koch_robot_preset(self):
         def set_operating_mode_(arm):
             from lerobot.common.robot_devices.motors.dynamixel import TorqueMode
@@ -411,11 +572,7 @@ class ManipulatorRobot:
             for name in self.leader_arms:
                 set_operating_mode_(self.leader_arms[name])
 
-                # Enable torque on the gripper of the leader arms, and move it to 45 degrees,
-                # so that we can use it as a trigger to close the gripper of the follower arms.
-                self.leader_arms[name].write("Torque_Enable", 1, "gripper")
-                self.leader_arms[name].write("Goal_Position", self.config.gripper_open_degree, "gripper")
-
+    @guarded_setup
     def set_aloha_robot_preset(self):
         def set_shadow_(arm):
             # Set secondary/shadow ID for shoulder and elbow. These joints have two motors.
@@ -465,6 +622,7 @@ class ManipulatorRobot:
                 stacklevel=1,
             )
 
+    @guarded_setup
     def set_so100_robot_preset(self):
         for name in self.follower_arms:
             # Mode=0 for Position Control
@@ -482,6 +640,19 @@ class ManipulatorRobot:
     def teleop_step(
         self, record_data=False
     ) -> None | tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        self._check_control_fault()
+        if not self.is_connected:
+            raise RobotDeviceNotConnectedError(
+                "ManipulatorRobot is not connected. You need to run `robot.connect()`."
+            )
+        self.completed_follower_arms = []
+        try:
+            return self._teleop_step_unchecked(record_data)
+        except Exception as exc:
+            self._latch_control_fault(exc)
+            raise
+
+    def _teleop_step_unchecked(self, record_data=False):
         if not self.is_connected:
             raise RobotDeviceNotConnectedError(
                 "ManipulatorRobot is not connected. You need to run `robot.connect()`."
@@ -491,8 +662,9 @@ class ManipulatorRobot:
         leader_pos = {}
         for name in self.leader_arms:
             before_lread_t = time.perf_counter()
-            pos = self.leader_arms[name].read("Present_Position")
-            pos = torch.from_numpy(pos)
+            expected = len(self.leader_arms[name].motor_names)
+            pos = checked_motor_read(self.leader_arms[name].read("Present_Position"), expected,
+                                     f"leader {name} position")
 
             # Initialize or update smoothed position with EMA filter.
             if name not in self.smoothed_leader_pos:
@@ -502,27 +674,33 @@ class ManipulatorRobot:
                 self.smoothing_factor * pos
                 + (1 - self.smoothing_factor) * self.smoothed_leader_pos[name]
             )
+            validate_control_positions(self.smoothed_leader_pos[name], expected, f"leader {name} EMA")
             leader_pos[name] = self.smoothed_leader_pos[name]
             self.logs[f"read_leader_{name}_pos_dt_s"] = time.perf_counter() - before_lread_t
 
-        # Send goal position to the follower
+        # Prepare and validate the entire batch before writing to any follower.
         follower_goal_pos = {}
+        prepared_writes = []
         for name in self.follower_arms:
-            before_fwrite_t = time.perf_counter()
             goal_pos = leader_pos[name]
+            expected = len(self.follower_arms[name].motor_names)
+            validate_control_positions(goal_pos, expected, f"follower {name} target")
 
             # Cap goal position when too far away from present position.
             # Slower fps expected due to reading from the follower.
             if self.config.max_relative_target is not None:
-                present_pos = self.follower_arms[name].read("Present_Position")
-                present_pos = torch.from_numpy(present_pos)
+                present_pos = checked_motor_read(self.follower_arms[name].read("Present_Position"), expected,
+                                                 f"follower {name} present position")
                 goal_pos = ensure_safe_goal_position(goal_pos, present_pos, self.config.max_relative_target)
 
-            # Used when record_data=True
+            validate_control_positions(goal_pos, expected, f"follower {name} final target")
             follower_goal_pos[name] = goal_pos
+            prepared_writes.append((name, goal_pos.numpy().astype(np.int32)))
 
-            goal_pos = goal_pos.numpy().astype(np.int32)
-            self.follower_arms[name].write("Goal_Position", goal_pos)
+        for name, target in prepared_writes:
+            before_fwrite_t = time.perf_counter()
+            self.follower_arms[name].write("Goal_Position", target)
+            self.completed_follower_arms.append(name)
             self.logs[f"write_follower_{name}_goal_pos_dt_s"] = time.perf_counter() - before_fwrite_t
 
         # Early exit when recording data is not requested
@@ -534,8 +712,10 @@ class ManipulatorRobot:
         follower_pos = {}
         for name in self.follower_arms:
             before_fread_t = time.perf_counter()
-            follower_pos[name] = self.follower_arms[name].read("Present_Position")
-            follower_pos[name] = torch.from_numpy(follower_pos[name])
+            follower_pos[name] = checked_motor_read(
+                self.follower_arms[name].read("Present_Position"),
+                len(self.follower_arms[name].motor_names), f"follower {name} recorded position"
+            )
             self.logs[f"read_follower_{name}_pos_dt_s"] = time.perf_counter() - before_fread_t
 
         # Create state by concatenating follower current position
@@ -572,17 +752,28 @@ class ManipulatorRobot:
 
     def capture_observation(self):
         """The returned observations do not have a batch dimension."""
+        self._check_control_fault()
         if not self.is_connected:
             raise RobotDeviceNotConnectedError(
                 "ManipulatorRobot is not connected. You need to run `robot.connect()`."
             )
 
+        try:
+            return self._capture_observation_unchecked()
+        except Exception as exc:
+            self._latch_control_fault(exc)
+            raise
+
+    def _capture_observation_unchecked(self):
+
         # Read follower position
         follower_pos = {}
         for name in self.follower_arms:
             before_fread_t = time.perf_counter()
-            follower_pos[name] = self.follower_arms[name].read("Present_Position")
-            follower_pos[name] = torch.from_numpy(follower_pos[name])
+            follower_pos[name] = checked_motor_read(
+                self.follower_arms[name].read("Present_Position"),
+                len(self.follower_arms[name].motor_names), f"follower {name} observed position"
+            )
             self.logs[f"read_follower_{name}_pos_dt_s"] = time.perf_counter() - before_fread_t
 
         # Create state by concatenating follower current position
@@ -618,33 +809,51 @@ class ManipulatorRobot:
         Args:
             action: tensor containing the concatenated goal positions for the follower arms.
         """
+        self._check_control_fault()
+        if not self.is_connected:
+            raise RobotDeviceNotConnectedError(
+                "ManipulatorRobot is not connected. You need to run `robot.connect()`."
+            )
+        self.completed_follower_arms = []
+        try:
+            return self._send_action_unchecked(action)
+        except Exception as exc:
+            self._latch_control_fault(exc)
+            raise
+
+    def _send_action_unchecked(self, action: torch.Tensor) -> torch.Tensor:
         if not self.is_connected:
             raise RobotDeviceNotConnectedError(
                 "ManipulatorRobot is not connected. You need to run `robot.connect()`."
             )
 
+        expected_total = sum(len(arm.motor_names) for arm in self.follower_arms.values())
+        validate_control_positions(action, expected_total, "action")
         from_idx = 0
         to_idx = 0
         action_sent = []
+        prepared_writes = []
         for name in self.follower_arms:
             # Get goal position of each follower arm by splitting the action vector
             to_idx += len(self.follower_arms[name].motor_names)
             goal_pos = action[from_idx:to_idx]
             from_idx = to_idx
+            expected = len(self.follower_arms[name].motor_names)
 
             # Cap goal position when too far away from present position.
             # Slower fps expected due to reading from the follower.
             if self.config.max_relative_target is not None:
-                present_pos = self.follower_arms[name].read("Present_Position")
-                present_pos = torch.from_numpy(present_pos)
+                present_pos = checked_motor_read(self.follower_arms[name].read("Present_Position"), expected,
+                                                 f"follower {name} present position")
                 goal_pos = ensure_safe_goal_position(goal_pos, present_pos, self.config.max_relative_target)
 
-            # Save tensor to concat and return
+            validate_control_positions(goal_pos, expected, f"follower {name} final target")
             action_sent.append(goal_pos)
+            prepared_writes.append((name, goal_pos.numpy().astype(np.int32)))
 
-            # Send goal position to each follower
-            goal_pos = goal_pos.numpy().astype(np.int32)
-            self.follower_arms[name].write("Goal_Position", goal_pos)
+        for name, target in prepared_writes:
+            self.follower_arms[name].write("Goal_Position", target)
+            self.completed_follower_arms.append(name)
 
         return torch.cat(action_sent)
 
@@ -653,22 +862,21 @@ class ManipulatorRobot:
         # TODO(aliberts): move robot-specific logs logic here
 
     def disconnect(self):
-        if not self.is_connected:
+        if not self.is_connected and not self._resources_needing_disconnect:
             raise RobotDeviceNotConnectedError(
                 "ManipulatorRobot is not connected. You need to run `robot.connect()` before disconnecting."
             )
 
-        for name in self.follower_arms:
-            self.follower_arms[name].disconnect()
-
-        for name in self.leader_arms:
-            self.leader_arms[name].disconnect()
-
-        for name in self.cameras:
-            self.cameras[name].disconnect()
-
-        self.is_connected = False
+        failures = self._disconnect_pending_devices()
+        if failures:
+            error = RobotDisconnectError(failures)
+            if self.control_fault is None:
+                self._latch_control_fault(error)
+            raise error
 
     def __del__(self):
-        if getattr(self, "is_connected", False):
-            self.disconnect()
+        if getattr(self, "is_connected", False) or getattr(self, "_resources_needing_disconnect", {}):
+            try:
+                self.disconnect()
+            except Exception:
+                logging.exception("ManipulatorRobot destructor could not confirm all devices disconnected")

@@ -115,20 +115,17 @@ class PortHandler:
         
     def open(self, port) -> bool:
         self.close()
-        
-        try:
-            self._port = port
-            self.__serial = Serial(port=port, 
-                                baudrate=self._baudrate, 
-                                bytesize=self.bytesize, 
-                                parity=self.parity, 
-                                stopbits=self._stopbits,
-                                timeout=self._read_timeout,
-                                write_timeout=self._write_timeout)
-            self.__is_running = True
-            return True
-        except Exception as e:
-            return False
+        self._port = port
+        # Preserve the transport exception for the bus and robot fault handlers.
+        self.__serial = Serial(port=port,
+                               baudrate=self._baudrate,
+                               bytesize=self.bytesize,
+                               parity=self.parity,
+                               stopbits=self._stopbits,
+                               timeout=self._read_timeout,
+                               write_timeout=self._write_timeout)
+        self.__is_running = True
+        return True
         
     def is_open(self) -> bool:
         # if self.__serial and self.__is_running:
@@ -138,11 +135,15 @@ class PortHandler:
         return False
             
     def close(self):
-        # if self.__serial and self.__serial.__is_running:
-        if self.__serial and self.__serial.is_open:
+        if self.__serial is None:
+            return
+        if self.__serial.is_open:
             self.__serial.close()
-            self.__is_running = False
-            self.__serial = None
+            if self.__serial.is_open:
+                raise OSError(f"Serial port {self._port!r} remains open after close()")
+        # Only discard the handle after the closed state was observed.
+        self.__is_running = False
+        self.__serial = None
         
     def list_ports(self):
         ports = list_ports.comports()
