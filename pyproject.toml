@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77,<82", "wheel>=0.44,<1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "embodied-offline-control-lab"
+version = "0.1.0"
+description = "Hardware-isolated SO-100 leader-follower software validation"
+requires-python = ">=3.10"
+license = "MIT"
+dependencies = ["PyYAML==6.0.2"]
+
+[project.scripts]
+robotics-offline = "offline_control.cli:main"
+
+[tool.setuptools]
+packages = ["offline_control"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests_offline"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
