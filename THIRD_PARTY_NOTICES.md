@@ -17,6 +17,8 @@ The source repository identifies Hugging Face LeRobot and ALOHA-derived work in 
 
 Python dependencies listed in `third_party/genkiarm/pyproject.toml` and `requirements.txt` are referenced for installation and are not vendored into this repository. Each dependency remains governed by its own package license.
 
+The original offline package uses [PyYAML 6.0.2](https://pypi.org/project/PyYAML/6.0.2/) as a pinned runtime dependency. Its declared license is MIT. It is installed as a dependency, not copied into this repository. Pytest 8.3.5, Ruff 0.11.13, mypy 1.15.0 and build 1.2.2.post1 are pinned test/build tools in CI, not runtime dependencies.
+
 ## Repository-authored content
 
-The root README, files under `docs/`, and the SVG under `assets/images/architecture/` were created for this repository and are covered by the root `LICENSE`.
+The root README, files under `docs/`, the SVG under `assets/images/architecture/`, and the original `offline_control/` and `tests_offline/` modules were created for this repository and are covered by the root `LICENSE`.

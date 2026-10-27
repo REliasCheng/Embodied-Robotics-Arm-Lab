@@ -1,5 +1,24 @@
 # Embodied-Robotics-Arm-Lab
 
+## Original offline control lab
+
+The new [`offline_control/`](offline_control/) Python package runs a synthetic leader-to-follower
+control path against the **actual** [`so100.yaml`](third_party/genkiarm/lerobot/configs/robot/so100.yaml)
+configuration. It validates names and IDs, maps six channels, records commands on an in-memory
+Fake Bus, latches transport faults, and supports explicit recovery plus bounded replay.
+The [offline control guide](docs/offline-control-foundation.md) documents its state and fault contracts.
+
+```powershell
+py -3.10 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\robotics-offline.exe --scenario normal --config third_party/genkiarm/lerobot/configs/robot/so100.yaml
+```
+
+The CLI also runs `invalid-input`, `transport-fault`, `recovery`, and `replay`. All inputs and
+outputs are synthetic software units. The original GenkiArm / LeRobot third-party source remains
+separate, unmodified and attributed. Offline success does not demonstrate motor motion, physical
+E-stop, calibration, camera capture, datasets, trained policies or autonomous manipulation.
+
 基于 GenkiArm / LeRobot 代码基础的 leader–follower 机械臂集成实验，聚焦双臂配置、串口电机接口、相机输入与遥操作数据通路。
 
 **🦾 Leader–Follower Control Path**
@@ -16,9 +35,9 @@
 | Control | LeRobot teleoperate、record 与 replay workflows |
 | Communication | USB serial motor buses；GBot leader 与 Feetech follower backends |
 | Camera Interface | Optional OpenCV camera entries defined in configuration |
-| Evidence | Source/configuration review and Python AST syntax validation completed；host functional tests、package build、hardware validation and runtime evidence not provided |
+| Evidence | Third-party source/configuration review and AST syntax validation; original offline package has Host tests/build/CI; hardware and third-party runtime not verified |
 
-> 🧪 **Evidence:** 公开源码与配置入口可定位，Python AST syntax validation 已通过；host functional test、package build、机械臂硬件与 runtime evidence 尚未提供。
+> 🧪 **Evidence:** 第三方源码与配置入口可定位，AST syntax validation 已通过。新增原创离线包提供 Host 测试与构建；第三方 runtime 和机械臂硬件仍未验证。
 
 ## 📌 Overview
 
@@ -103,13 +122,13 @@ Embodied-Robotics-Arm-Lab/
 
 ### 💻 Host Test
 
-**Status:** Not Provided. 当前公开仓库未提供独立的 host-side functional test 或 integration test。
+**Original offline package:** Host unit/integration tests in `tests_offline/`; see [offline control guide](docs/offline-control-foundation.md) and CI. Third-party robot runtime is not covered.
 
 **Syntax Validation:** Passed. Published Python source files completed AST syntax validation without syntax errors.
 
 ### 🔨 Build Verification
 
-**Status:** Not Performed. 本机未提供 `build` 与 `poetry-core`，未安装额外依赖，也未生成 source distribution 或 wheel。
+**Original offline package:** Built as wheel and sdist with `python -m build`. This is separate from the third-party GenkiArm package, which remains unbuilt in this work.
 
 ### 🔌 Hardware Validation
 
@@ -117,7 +136,7 @@ Embodied-Robotics-Arm-Lab/
 
 ### 📊 Runtime Evidence
 
-**Status:** Not Provided. 当前公开内容没有 teleoperation log、joint trace、camera capture、dataset recording result 或 policy execution evidence。
+**Original offline package:** Deterministic synthetic joint trace and Fake Bus command capture are tested. No real teleoperation log, camera capture, dataset recording or policy execution evidence exists.
 
 源码和配置入口存在，不等同于机械臂已经连接、标定或运行成功。验证范围与复现前提见 [Verification](docs/verification.md)。
 
